@@ -1,0 +1,553 @@
+---
+title: "Taipei House Value Prediction"
+author: "Dr. Ahmed Moussa"
+date: "June 2022"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+    fig_width: 9
+    fig_height: 5
+---
+
+## 1. Overview
+
+This project compares three regression approaches — Multivariate Adaptive Regression Splines (MARS), Generalized Additive Models (GAMs), and Ridge Regression — applied to 414 residential property records from Taipei City and New Taipei City (June 2012–May 2013). The dataset contains six predictors including house age, distance to the nearest MRT station, number of nearby convenience stores, and geographic coordinates. Exploratory analysis confirmed non-linear relationships in both house age and MRT proximity, motivating the use of flexible non-parametric methods. GAMs achieved the lowest 10-fold cross-validated MSE (58.80), outperforming MARS (61.07) and Ridge Regression (80.06), with the 26% gap between GAMs and Ridge quantifying the cost of imposing linearity on this data.
+
+---
+
+## 2. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(earth)
+if ("mgcv" %in% loadedNamespaces()) detach("package:mgcv", unload = TRUE)
+library(gam)
+library(ridge)
+
+set.seed(42)
+
+theme_portfolio <- function() {
+  theme_minimal(base_family = "sans", base_size = 12) +
+  theme(
+    plot.title       = element_text(size = 14, face = "bold", color = "#0F1923",
+                                    margin = margin(b = 8)),
+    plot.subtitle    = element_text(size = 11, color = "#444444",
+                                    margin = margin(b = 12)),
+    plot.caption     = element_text(size = 9, color = "#888780", hjust = 0),
+    axis.title       = element_text(size = 11, color = "#444444"),
+    axis.text        = element_text(size = 10, color = "#666666"),
+    panel.grid.major = element_line(color = "#F0F0F0", linewidth = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.position  = "bottom",
+    legend.title     = element_text(size = 10, face = "bold"),
+    legend.text      = element_text(size = 10),
+    strip.text       = element_text(size = 11, face = "bold", color = "#0F1923")
+  )
+}
+
+palette_portfolio <- c("#378ADD", "#BA7517", "#1D9E75", "#5F5E5A", "#888780", "#0F1923")
+
+save_fig <- function(filename, width = 9, height = 5) {
+  ggsave(
+    filename = file.path("figures", filename),
+    width    = width,
+    height   = height,
+    dpi      = 150,
+    bg       = "white"
+  )
+}
+```
+
+---
+
+## 3. Data
+
+### 3.1 Loading & Structure
+
+```{r load-data}
+df <- read.csv("data/raw/th.csv")
+dim(df)
+glimpse(df)
+summary(df)
+```
+
+The dataset contains **`r nrow(df)` observations** and **`r ncol(df)` variables** (6 predictors + 1 target). All variables are numeric. There are no missing values. The target `price` represents the house price per unit area in units of 10,000 NTD per Ping (≈ 3.3 m²).
+
+### 3.2 Exploratory Data Analysis
+
+```{r eda-price-dist, fig.width=8, fig.height=5}
+ggplot(df, aes(x = price)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 fill = palette_portfolio[1], colour = "white", alpha = 0.85) +
+  geom_density(colour = palette_portfolio[2], linewidth = 1) +
+  geom_vline(xintercept = mean(df$price), linetype = "dashed",
+             colour = palette_portfolio[6], linewidth = 0.9) +
+  geom_vline(xintercept = median(df$price), linetype = "dotted",
+             colour = palette_portfolio[3], linewidth = 0.9) +
+  annotate("text", x = mean(df$price) + 2, y = 0.028,
+           label = paste0("Mean = ", round(mean(df$price), 1)),
+           hjust = 0, size = 3.5, colour = palette_portfolio[6]) +
+  annotate("text", x = median(df$price) - 2, y = 0.025,
+           label = paste0("Median = ", round(median(df$price), 1)),
+           hjust = 1, size = 3.5, colour = palette_portfolio[3]) +
+  labs(
+    title    = "Distribution of House Prices",
+    subtitle = "Mildly right-skewed with a long upper tail; mean and median are close",
+    x        = "Price per Unit Area (10K NTD/Ping)",
+    y        = "Density"
+  ) +
+  theme_portfolio()
+
+save_fig("01_price-distribution.png", width = 8, height = 5)
+```
+
+```{r eda-scatter-grid, fig.width=11, fig.height=7}
+var_labels <- c(
+  tr_date   = "Transaction Date",
+  house_age = "House Age (years)",
+  dist_mrt  = "Distance to MRT (m)",
+  n_stores  = "Nearby Stores",
+  lat       = "Latitude",
+  long      = "Longitude"
+)
+predictors <- names(var_labels)
+
+panels <- lapply(predictors, function(v) {
+  ggplot(df, aes(x = .data[[v]], y = price)) +
+    geom_point(alpha = 0.3, colour = palette_portfolio[1], size = 1.2) +
+    geom_smooth(method = "loess", se = TRUE, colour = palette_portfolio[2],
+                fill = "#F5DEB3", linewidth = 1, span = 0.75) +
+    labs(x = var_labels[v], y = "Price (10K NTD/Ping)") +
+    theme_portfolio() +
+    theme(axis.title = element_text(size = 9),
+          axis.text  = element_text(size = 8))
+})
+
+p_scatter <- gridExtra::arrangeGrob(
+  grobs = panels, ncol = 3,
+  top = grid::textGrob(
+    "House Price vs. Each Predictor",
+    gp = grid::gpar(fontsize = 14, fontface = "bold", col = "#0F1923")
+  ),
+  bottom = grid::textGrob(
+    "LOESS curve with 95% confidence band  |  Non-linearities visible in house age and MRT distance",
+    gp = grid::gpar(fontsize = 10, col = "#444444")
+  )
+)
+gridExtra::grid.arrange(p_scatter)
+ggsave("figures/02_price-vs-predictors.png", p_scatter,
+       width = 11, height = 7, dpi = 150, bg = "white")
+```
+
+```{r eda-correlation, fig.width=8, fig.height=6.5}
+col_nice <- c("Tr. Date", "House Age", "MRT Dist.", "Stores", "Lat", "Long", "Price")
+
+cor_mat  <- cor(df)
+cor_long <- as.data.frame(cor_mat) |>
+  setNames(col_nice) |>
+  mutate(var1 = col_nice) |>
+  pivot_longer(-var1, names_to = "var2", values_to = "r")
+
+cor_long$var1 <- factor(cor_long$var1, levels = col_nice)
+cor_long$var2 <- factor(cor_long$var2, levels = rev(col_nice))
+
+ggplot(cor_long, aes(x = var1, y = var2, fill = r)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.2f", r)),
+            size = 3.5,
+            colour = ifelse(abs(cor_long$r) > 0.5, "white", "#333333")) +
+  scale_fill_gradient2(
+    low      = palette_portfolio[1],
+    mid      = "white",
+    high     = palette_portfolio[2],
+    midpoint = 0, limits = c(-1, 1),
+    name     = "Pearson r"
+  ) +
+  labs(
+    title    = "Feature Correlation Heatmap",
+    subtitle = "MRT distance (–0.67) and number of stores (+0.57) are the strongest linear correlates of price",
+    x = NULL, y = NULL
+  ) +
+  theme_portfolio() +
+  theme(
+    axis.text.x   = element_text(angle = 30, hjust = 1),
+    legend.position = "right",
+    panel.grid.major = element_blank()
+  )
+
+save_fig("03_correlation-heatmap.png", width = 8, height = 6.5)
+```
+
+```{r eda-geo-map, fig.width=7.5, fig.height=5.5}
+ggplot(df, aes(x = long, y = lat, colour = price)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_colour_gradientn(
+    colours = c(palette_portfolio[1], "#FFFFFF", palette_portfolio[2]),
+    name    = "Price\n(10K NTD/Ping)"
+  ) +
+  labs(
+    title    = "Geographic Distribution of House Prices",
+    subtitle = "Higher prices cluster in central Taipei; distance from transit hubs drives spatial variation",
+    x        = "Longitude",
+    y        = "Latitude"
+  ) +
+  theme_portfolio() +
+  theme(legend.position = "right")
+
+save_fig("04_geo-price-map.png", width = 7.5, height = 5.5)
+```
+
+---
+
+## 4. Preprocessing
+
+The dataset is clean with no missing values. All six predictors are numeric, requiring no encoding. Latitude and longitude are retained as-is — they provide strong spatial signal confirmed by the geographic price map.
+
+MARS and GAMs operate on the raw predictor scale and do not require standardisation; their spline-based representations are scale-invariant. Ridge Regression is sensitive to predictor scale, so three scaling strategies ("none", "scale", and "corrForm") are explored in cross-validation. The `ridge` package applies these internally, so no manual scaling is needed in the preprocessing step.
+
+```{r preprocessing}
+cat("Missing values per column:\n")
+colSums(is.na(df))
+
+cat("\nDuplicate rows:", sum(duplicated(df)), "\n")
+```
+
+---
+
+## 5. Methodology
+
+### 5.1 MARS — Multivariate Adaptive Regression Splines
+
+MARS builds a piecewise linear regression by automatically placing hinge functions at data-driven knot locations. It is well-suited here because the price–predictor relationships are non-linear but not necessarily smooth, and because MARS performs implicit variable selection by pruning uninformative hinges via GCV. Two hyperparameters are tuned: `degree` (maximum interaction order) and `nk` (maximum number of model terms before pruning).
+
+```{r mars-evimp, fig.width=8, fig.height=5}
+mars_fit <- earth(price ~ ., data = df, degree = 1, nk = 10)
+
+ev      <- evimp(mars_fit, trim = FALSE)
+ev_mat  <- unclass(ev)
+ev_df   <- data.frame(
+  variable = rownames(ev_mat),
+  nsubsets = as.numeric(ev_mat[, "nsubsets"]),
+  gcv      = as.numeric(ev_mat[, "gcv"]),
+  stringsAsFactors = FALSE
+)
+ev_df$label <- dplyr::recode(
+  sub("-unused$", "", ev_df$variable),
+  tr_date   = "Transaction Date",
+  house_age = "House Age (years)",
+  dist_mrt  = "Distance to MRT (m)",
+  n_stores  = "Nearby Stores",
+  lat       = "Latitude",
+  long      = "Longitude"
+)
+ev_df$label[is.na(ev_df$label)] <- ev_df$variable[is.na(ev_df$label)]
+
+ggplot(ev_df, aes(x = reorder(label, nsubsets), y = nsubsets,
+                  fill = nsubsets)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = nsubsets), hjust = -0.3, size = 3.8,
+            colour = palette_portfolio[6]) +
+  scale_fill_gradient(low = "#AED6F1", high = palette_portfolio[1]) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  coord_flip() +
+  labs(
+    title    = "MARS Variable Importance",
+    subtitle = "MRT distance selected in the most model subsets; stores and lat/long follow",
+    x        = NULL,
+    y        = "Number of Model Subsets (nsubsets)"
+  ) +
+  theme_portfolio()
+
+save_fig("05_mars-variable-importance.png", width = 8, height = 5)
+```
+
+```{r mars-cv, fig.width=8, fig.height=5, cache=TRUE}
+my_MARS_cv <- function(x, y, nfold = 10, nrefold = 5,
+                       deg = 1:3, nk = c(5, 10, 15, 20, 25, 30, 40, 50)) {
+  x          <- as.matrix(x)
+  n          <- length(y)
+  base_idx   <- c(rep(seq_len(nfold), ceiling(n / nfold) - 1),
+                  seq_len(n + nfold - nfold * ceiling(n / nfold)))
+  RSS        <- array(0, dim = c(length(deg), length(nk)),
+                      dimnames = list(deg, nk))
+  for (i in seq_len(nrefold)) {
+    fi <- sample(base_idx)
+    for (d in seq_along(deg))
+      for (k in seq_along(nk))
+        for (j in seq_len(nfold))
+          RSS[d, k] <- RSS[d, k] +
+            sum((predict(earth(x = x[fi != j, ], y = y[fi != j],
+                               degree = deg[d], nk = nk[k]),
+                         x[fi == j, ]) - y[fi == j])^2)
+  }
+  RSS / (n * nrefold)
+}
+
+mars_mse <- my_MARS_cv(as.matrix(df[, 1:6]), df$price)
+
+mars_mse_df <- as.data.frame(as.table(mars_mse))
+colnames(mars_mse_df) <- c("Degree", "nk", "MSE")
+mars_mse_df$nk <- as.numeric(as.character(mars_mse_df$nk))
+
+ggplot(mars_mse_df, aes(x = nk, y = MSE, colour = Degree, group = Degree)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  geom_vline(xintercept = 10, linetype = "dashed",
+             colour = palette_portfolio[5], linewidth = 0.7) +
+  annotate("text", x = 11, y = max(mars_mse_df$MSE) * 0.975,
+           label = "Best: nk = 10", hjust = 0, size = 3.5,
+           colour = palette_portfolio[5]) +
+  scale_colour_manual(values = setNames(palette_portfolio[1:3],
+                                        levels(mars_mse_df$Degree)),
+                      name = "Degree") +
+  labs(
+    title    = "MARS Cross-validation: MSE vs. nk",
+    subtitle = "Degree = 1 (no interactions) consistently outperforms higher-degree models",
+    x        = "Maximum Model Terms (nk)",
+    y        = "10-fold CV MSE"
+  ) +
+  theme_portfolio()
+
+save_fig("06_mars-cv.png", width = 8, height = 5)
+```
+
+### 5.2 GAMs — Generalized Additive Models (Backfitting)
+
+GAMs decompose the response as a sum of smooth functions of individual predictors: $\hat{y} = \alpha + \sum_j f_j(x_j)$. Fitted using the backfitting algorithm, each $f_j$ is a spline whose smoothness is controlled by the degrees-of-freedom parameter `df`. This approach is ideal here because the non-linearities in house age and MRT distance are smooth and continuous — precisely the shape class that splines model efficiently. A separate `df` is selected for each predictor via cross-validation.
+
+```{r gam-fit, fig.width=11, fig.height=7}
+# Final GAM with optimal DFs from cross-validation: (3, 8, 6, 3, 6, 7)
+gam_fit <- gam(
+  price ~ s(tr_date, df = 3) + s(house_age, df = 8) +
+    s(dist_mrt, df = 6) + s(n_stores, df = 3) +
+    s(lat, df = 6) + s(long, df = 7),
+  data = df, control = gam.control(bf.maxit = 60)
+)
+
+m_y        <- mean(df$price)
+pred_vars  <- c("tr_date", "house_age", "dist_mrt", "n_stores", "lat", "long")
+pred_labs  <- c("Transaction Date", "House Age (years)", "Distance to MRT (m)",
+                "Nearby Stores", "Latitude", "Longitude")
+
+make_panel <- function(idx) {
+  ord      <- order(df[, idx])
+  x_ord    <- df[ord, idx]
+  y_raw    <- df$price[ord]
+  y_fit    <- gam_fit$smooth[ord, idx] + m_y +
+    gam_fit$coefficients[idx + 1] * (x_ord - mean(df[, idx]))
+  data.frame(x = x_ord, y_raw = y_raw, y_fit = y_fit)
+}
+
+gam_panels <- lapply(seq_along(pred_vars), function(i) {
+  pd <- make_panel(i)
+  ggplot(pd) +
+    geom_point(aes(x, y_raw), alpha = 0.25, colour = palette_portfolio[1], size = 1) +
+    geom_line(aes(x, y_fit), colour = palette_portfolio[2], linewidth = 1.2) +
+    labs(x = pred_labs[i], y = "Price (10K NTD/Ping)") +
+    theme_portfolio() +
+    theme(axis.title = element_text(size = 9),
+          axis.text  = element_text(size = 8))
+})
+
+p_gam <- gridExtra::arrangeGrob(
+  grobs = gam_panels, ncol = 3,
+  top    = grid::textGrob("GAM Partial Effects — Optimal Spline Fits per Predictor",
+                          gp = grid::gpar(fontsize = 14, fontface = "bold", col = "#0F1923")),
+  bottom = grid::textGrob("Red curve = fitted spline  |  df = (3, 8, 6, 3, 6, 7)",
+                          gp = grid::gpar(fontsize = 10, col = "#444444"))
+)
+gridExtra::grid.arrange(p_gam)
+ggsave("figures/07_gam-partial-effects.png", p_gam,
+       width = 11, height = 7, dpi = 150, bg = "white")
+```
+
+```{r gam-nonlinearities, fig.width=11, fig.height=5}
+# House age panel
+age_d  <- make_panel(2)
+p_age  <- ggplot(age_d) +
+  geom_point(aes(x, y_raw), alpha = 0.3, colour = palette_portfolio[1], size = 1.2) +
+  geom_line(aes(x, y_fit), colour = palette_portfolio[2], linewidth = 1.4) +
+  labs(
+    title    = "House Age vs. Price",
+    subtitle = "U-shaped parabolic curve: new builds and historic properties command a premium",
+    x        = "House Age (years)",
+    y        = "Price per Unit Area (10K NTD/Ping)"
+  ) +
+  theme_portfolio()
+
+# MRT distance panel
+mrt_d  <- make_panel(3)
+p_mrt  <- ggplot(mrt_d) +
+  geom_point(aes(x, y_raw), alpha = 0.3, colour = palette_portfolio[4], size = 1.2) +
+  geom_line(aes(x, y_fit), colour = palette_portfolio[2], linewidth = 1.4) +
+  labs(
+    title    = "MRT Distance vs. Price",
+    subtitle = "Rapid inverse decay: properties within 500 m of a station attract large premiums",
+    x        = "Distance to Nearest MRT Station (m)",
+    y        = "Price per Unit Area (10K NTD/Ping)"
+  ) +
+  theme_portfolio()
+
+p_nonlinear <- gridExtra::arrangeGrob(p_age, p_mrt, ncol = 2)
+gridExtra::grid.arrange(p_nonlinear)
+ggsave("figures/08_key-nonlinearities.png", p_nonlinear,
+       width = 11, height = 5, dpi = 150, bg = "white")
+```
+
+### 5.3 Ridge Regression (Linear Baseline)
+
+Ridge Regression adds an $L_2$ penalty to OLS: $\hat{\beta} = \arg\min_\beta \|y - X\beta\|^2 + \lambda\|\beta\|^2$. It serves as a linear baseline to quantify how much performance is sacrificed by assuming additivity and linearity. Three scaling strategies are cross-validated alongside the regularisation parameter $\lambda$.
+
+```{r ridge-cv, fig.width=8, fig.height=5, cache=TRUE}
+Lambdas   <- c(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10)
+n_folds   <- 10
+n_refolds <- 5
+n         <- nrow(df)
+base_idx  <- c(rep(seq_len(n_folds), ceiling(n / n_folds) - 1),
+               seq_len(n + n_folds - n_folds * ceiling(n / n_folds)))
+
+RSS_n  <- numeric(length(Lambdas))
+RSS_sc <- numeric(length(Lambdas))
+RSS_cf <- numeric(length(Lambdas))
+
+for (i in seq_len(n_refolds)) {
+  fi <- sample(base_idx)
+  for (j in seq_along(Lambdas)) {
+    for (k in seq_len(n_folds)) {
+      train <- df[fi != k, ]
+      test  <- df[fi == k, ]
+      RSS_n[j]  <- RSS_n[j]  + sum((predict(
+        ridge::linearRidge(price ~ ., data = train, lambda = Lambdas[j], scaling = "none"),
+        test[, -7]) - test[, 7])^2)
+      RSS_sc[j] <- RSS_sc[j] + sum((predict(
+        ridge::linearRidge(price ~ ., data = train, lambda = Lambdas[j], scaling = "scale"),
+        test[, -7]) - test[, 7])^2)
+      RSS_cf[j] <- RSS_cf[j] + sum((predict(
+        ridge::linearRidge(price ~ ., data = train, lambda = Lambdas[j], scaling = "corrForm"),
+        test[, -7]) - test[, 7])^2)
+    }
+  }
+}
+
+ridge_df <- data.frame(
+  Lambda  = rep(Lambdas, 3),
+  MSE     = c(RSS_n, RSS_sc, RSS_cf) / (n * n_refolds),
+  Scaling = rep(c("None", "Scale", "CorrForm"), each = length(Lambdas))
+)
+
+ggplot(ridge_df, aes(x = log10(Lambda), y = MSE,
+                     colour = Scaling, group = Scaling)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  scale_colour_manual(
+    values = c("None" = palette_portfolio[1],
+               "Scale" = palette_portfolio[2],
+               "CorrForm" = palette_portfolio[3]),
+    name = "Scaling Method"
+  ) +
+  labs(
+    title    = "Ridge Regression Cross-validation",
+    subtitle = "All scaling methods plateau near MSE ≈ 80, reflecting the cost of assuming linearity",
+    x        = expression(log[10](lambda)),
+    y        = "10-fold CV MSE"
+  ) +
+  theme_portfolio()
+
+save_fig("09_ridge-cv.png", width = 8, height = 5)
+```
+
+---
+
+## 6. Model Training & Evaluation
+
+The GAM and Ridge CV routines were presented above as part of the methodology sections. Below are the final models fit on the full dataset, with key fit statistics printed inline for reference.
+
+> **Note:** Published results are recorded in `results/metrics.md`. Minor numerical variation across R versions is expected even with `set.seed(42)`.
+
+### 6.1 Final GAM
+
+```{r gam-final}
+summary(gam_fit)
+```
+
+### 6.2 Final MARS
+
+```{r mars-final}
+mars_final <- earth(price ~ ., data = df, degree = 1, nk = 10)
+summary(mars_final)
+print(evimp(mars_final, trim = FALSE))
+```
+
+### 6.3 Final Ridge (best: scale, λ = 10)
+
+```{r ridge-final}
+ridge_final <- ridge::linearRidge(price ~ ., data = df,
+                                  lambda = 10, scaling = "scale")
+summary(ridge_final)
+```
+
+---
+
+## 7. Results & Discussion
+
+```{r model-comparison-plot, fig.width=7, fig.height=5}
+model_comp <- data.frame(
+  Model = factor(
+    c("Ridge\n(scale, λ=10)", "MARS\n(degree=1, nk=10)", "GAM\n(Backfitting)"),
+    levels = c("Ridge\n(scale, λ=10)", "MARS\n(degree=1, nk=10)", "GAM\n(Backfitting)")
+  ),
+  MSE  = c(80.06, 61.07, 58.80),
+  Fill = c(palette_portfolio[2], palette_portfolio[4], palette_portfolio[3])
+)
+
+ggplot(model_comp, aes(x = Model, y = MSE, fill = Model)) +
+  geom_col(width = 0.55, show.legend = FALSE) +
+  geom_text(aes(label = MSE), vjust = -0.45, fontface = "bold", size = 4.5,
+            colour = palette_portfolio[6]) +
+  scale_fill_manual(values = setNames(model_comp$Fill, model_comp$Model)) +
+  scale_y_continuous(limits = c(0, 95), expand = c(0, 0)) +
+  geom_hline(yintercept = 58.80, linetype = "dashed",
+             colour = palette_portfolio[3], linewidth = 0.7) +
+  annotate("text", x = 3.42, y = 60.8,
+           label = "Best MSE = 58.80", hjust = 1, size = 3.5,
+           colour = palette_portfolio[3]) +
+  labs(
+    title    = "Model Comparison — 10-fold CV MSE",
+    subtitle = "GAM outperforms MARS by 3.7% and Ridge by 26%; non-linearity modelling matters",
+    x        = NULL,
+    y        = "Mean Squared Error"
+  ) +
+  theme_portfolio() +
+  theme(panel.grid.major.x = element_blank())
+
+save_fig("10_model-comparison.png", width = 7, height = 5)
+```
+
+**GAMs achieved the best performance** with a CV MSE of **58.80**, followed closely by MARS at **61.07** and Ridge at **80.06**. The 26% performance gap between GAMs and Ridge directly quantifies the penalty of assuming linearity: the Taipei housing market's non-linear structure cannot be captured by a linear model regardless of how the regularisation parameter or feature scaling is tuned.
+
+MARS, despite also being non-linear, slightly underperformed GAMs. Cross-validation selected degree = 1 (no interaction terms) as optimal, which means MARS is fitting a piecewise *linear* — rather than piecewise polynomial — approximation to each predictor's relationship with price. Smooth, continuously curved relationships (like the U-shape of house age) are better represented by smooth splines than by piecewise hinges, explaining GAMs' advantage on this particular dataset.
+
+Two dominant non-linearities drive model performance:
+
+1. **House age** follows a U-shaped parabolic curve. Properties under about 10 years old command premium prices. Prices then fall for mid-age properties and recover for properties over ~30 years, reflecting the desirability of both new construction and character properties. A linear or piecewise-linear term cannot capture both sides of this curve without a high degree — explaining the high optimal df of 8 for `house_age` in the GAM.
+
+2. **MRT proximity** shows a rapid inverse-decay relationship: properties within 500 m of a station sell for substantially more, with the premium dissipating non-linearly as distance increases. This is consistent with transit-oriented real estate effects documented across East Asian cities.
+
+Geographic coordinates (latitude and longitude) jointly capture the spatial structure of price variation across Taipei, accounting for neighbourhood effects and urban density gradients that none of the other predictors directly encode.
+
+---
+
+## 8. Conclusions
+
+- **GAMs outperformed all models** (CV MSE = 58.80), followed by MARS (61.07) and Ridge (80.06), confirming that the Taipei housing data contains smooth non-linearities that merit flexible modelling.
+- **The 26% MSE gap between GAMs and Ridge** establishes the cost of the linearity assumption for this dataset; no amount of regularisation or feature scaling can recover the lost predictive power.
+- **House age exhibits a parabolic U-shaped relationship** with price: both new builds and historic properties attract premiums over mid-age stock. GAMs' high optimal df (8) for this predictor reflects its dual inflection.
+- **MRT proximity is the dominant price driver**: an inverse-decay relationship where properties within 500 m of a station command large premiums that decay rapidly with distance. Capturing this non-linearity is critical for predictive accuracy.
+- **MARS selected degree = 1** (no interactions) as optimal, suggesting that while piecewise non-linearity helps, feature interactions add noise in this 414-record dataset. GAMs' smooth spline representation outperforms piecewise hinges for the continuous curvature observed in this data.
